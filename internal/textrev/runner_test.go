@@ -1,0 +1,198 @@
+package textrev
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+func writeFile(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+const ins = `{"type": "insert", "boundary": 0, "insert": ["x"]}`
+
+func planFor(entries string) string {
+	return `{"files": [` + entries + `]}`
+}
+
+func TestRunSuccessAndSummary(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src")
+	writeFile(t, filepath.Join(src, "a.txt"), "one\ntwo\nthree\n")
+	writeFile(t, filepath.Join(src, "sub", "b.txt"), "x\ny")
+	planPath := filepath.Join(dir, "plan.json")
+	writeFile(t, planPath, `{
+	  "files": [
+	    {"path": "a.txt", "revisions": [
+	      {"type": "replace", "start": 2, "end": 2, "lines": [{"original": "two", "replacement": "TWO"}]},
+	      {"type": "insert", "boundary": 3, "insert": ["end"]}
+	    ]},
+	    {"path": "sub/b.txt", "revisions": [
+	      {"type": "replace", "start": 1, "end": 2, "lines": [
+	        {"original": "x", "replacement": "x"},
+	        {"original": "y", "replacement": ""}
+	      ]}
+	    ]}
+	  ]
+	}`)
+	out := filepath.Join(dir, "out")
+	summary, err := Run(planPath, src, out, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(summary.Files) != 2 {
+		t.Fatalf("want 2 file summaries, got %d", len(summary.Files))
+	}
+	first := summary.Files[0]
+	if first.OriginalLines != 3 || first.NewLines != 4 || first.RevisionCount != 2 {
+		t.Fatalf("unexpected summary: %+v", first)
+	}
+	data, err := os.ReadFile(filepath.Join(out, "a.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "one\nTWO\nthree\nend\n" {
+		t.Fatalf("a.txt = %q", data)
+	}
+	data, _ = os.ReadFile(filepath.Join(out, "sub", "b.txt"))
+	if string(data) != "x\n" {
+		t.Fatalf("b.txt = %q", data)
+	}
+}
+
+func TestRunMultiFileFailureCreatesNoOutput(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src")
+	writeFile(t, filepath.Join(src, "good.txt"), "a\nb\n")
+	writeFile(t, filepath.Join(src, "bad.txt"), "a\nb\n")
+	planPath := filepath.Join(dir, "plan.json")
+	writeFile(t, planPath, `{
+	  "files": [
+	    {"path": "good.txt", "revisions": [
+	      {"type": "replace", "start": 1, "end": 1, "lines": [{"original": "a", "replacement": "a"}]}
+	    ]},
+	    {"path": "bad.txt", "revisions": [
+	      {"type": "replace", "start": 1, "end": 1, "lines": [{"original": "MISMATCH", "replacement": "z"}]}
+	    ]}
+	  ]
+	}`)
+	out := filepath.Join(dir, "out")
+	_, err := Run(planPath, src, out, false)
+	if err == nil {
+		t.Fatal("expected mismatch failure")
+	}
+	if !strings.Contains(err.Error(), "bad.txt") || !strings.Contains(err.Error(), "mismatch") {
+		t.Fatalf("error must name path and revision: %v", err)
+	}
+	if _, statErr := os.Stat(out); !os.IsNotExist(statErr) {
+		t.Fatalf("output directory must not be created on failure: %v", statErr)
+	}
+}
+
+func TestRunCheckModeWritesNothing(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src")
+	writeFile(t, filepath.Join(src, "a.txt"), "a\n")
+	planPath := filepath.Join(dir, "plan.json")
+	writeFile(t, planPath, planFor(
+		`{"path": "a.txt", "revisions": [{"type": "insert", "boundary": 1, "insert": ["b"]}]}`))
+	out := filepath.Join(dir, "out")
+	if _, err := Run(planPath, src, out, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(out); !os.IsNotExist(err) {
+		t.Fatalf("check mode must not create output: %v", err)
+	}
+}
+
+func TestRejectsPathEscapeAndAbsolute(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src")
+	writeFile(t, filepath.Join(src, "a.txt"), "a\n")
+	for _, rel := range []string{"../escape.txt", "../../x", "/abs/a.txt"} {
+		planPath := filepath.Join(dir, "plan.json")
+		writeFile(t, planPath, planFor(
+			`{"path": "`+rel+`", "revisions": [`+ins+`]}`))
+		if _, err := Run(planPath, src, filepath.Join(dir, "out"), true); err == nil {
+			t.Fatalf("expected rejection for %s", rel)
+		}
+	}
+}
+
+func TestRejectsDuplicateNormalizedPaths(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src")
+	writeFile(t, filepath.Join(src, "a.txt"), "a\n")
+	planPath := filepath.Join(dir, "plan.json")
+	writeFile(t, planPath, planFor(
+		`{"path": "a.txt", "revisions": [`+
+			`{"type":"insert","boundary":0,"insert":["x"]}]},`+
+			`{"path": "./a.txt", "revisions": [`+
+			`{"type":"insert","boundary":0,"insert":["y"]}]}`))
+	_, err := Run(planPath, src, filepath.Join(dir, "out"), true)
+	if err == nil || !strings.Contains(err.Error(), "duplicates normalized path") {
+		t.Fatalf("expected duplicate rejection, got %v", err)
+	}
+}
+
+func TestRejectsSymlink(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src")
+	writeFile(t, filepath.Join(dir, "outside", "real.txt"), "a\n")
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(dir, "outside", "real.txt"), filepath.Join(src, "link.txt")); err != nil {
+		t.Skipf("symlink creation not supported: %v", err)
+	}
+	planPath := filepath.Join(dir, "plan.json")
+	writeFile(t, planPath, planFor(
+		`{"path": "link.txt", "revisions": [`+ins+`]}`))
+	_, err := Run(planPath, src, filepath.Join(dir, "out"), true)
+	if err == nil || !strings.Contains(err.Error(), "symbolic link") {
+		t.Fatalf("expected symlink rejection, got %v", err)
+	}
+}
+
+func TestEmptyFileAndDeleteAll(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src")
+	writeFile(t, filepath.Join(src, "empty.txt"), "")
+	writeFile(t, filepath.Join(src, "gone.txt"), "a\nb\n")
+	planPath := filepath.Join(dir, "plan.json")
+	writeFile(t, planPath, `{
+	  "files": [
+	    {"path": "empty.txt", "revisions": [
+	      {"type": "insert", "boundary": 0, "insert": ["seed"]}
+	    ]},
+	    {"path": "gone.txt", "revisions": [
+	      {"type": "replace", "start": 1, "end": 2, "lines": [
+	        {"original": "a", "replacement": ""},
+	        {"original": "b", "replacement": ""}
+	      ]}
+	    ]}
+	  ]
+	}`)
+	out := filepath.Join(dir, "out")
+	summary, err := Run(planPath, src, out, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Files[0].OriginalLines != 0 || summary.Files[0].NewLines != 1 {
+		t.Fatalf("empty file summary wrong: %+v", summary.Files[0])
+	}
+	if data, _ := os.ReadFile(filepath.Join(out, "gone.txt")); len(data) != 0 {
+		t.Fatalf("expected empty output file, got %q", data)
+	}
+	if data, _ := os.ReadFile(filepath.Join(out, "empty.txt")); string(data) != "seed\n" {
+		t.Fatalf("empty.txt = %q", data)
+	}
+}
